@@ -5,66 +5,41 @@ A receipt records the terminal state of a processing execution:
 either 'done' (stage completion) or 'timeout' (watchdog timeout).
 Only one terminal receipt should ever exist per execution_id.
 
+The store is an unsynchronized list of (execution_id, state) tuples.
+Using a list (rather than a dict) makes duplicate receipts visible as
+distinct entries — which is what we need to prove the race occurred.
+
 BUG: record_terminal() reads the current state and writes in separate
 steps without holding any lock. Two threads can both observe no existing
-receipt and both proceed to insert, producing duplicate terminal records.
+receipt and both proceed to append, producing duplicate terminal records.
 """
 
-import sqlite3
+from __future__ import annotations
+
 import threading
 from typing import Optional
 
+# Backing store: list of (execution_id, state) tuples.
+# A list is used so duplicate receipts accumulate as separate entries.
+# No internal synchronization — the race is real.
+_store: list[tuple[str, str]] = []
 
-_DB_PATH = ":memory:"
-_connection: Optional[sqlite3.Connection] = None
-_connection_lock = threading.Lock()
-
-
-def _get_connection() -> sqlite3.Connection:
-    """Return the shared in-memory SQLite connection (created once)."""
-    global _connection
-    with _connection_lock:
-        if _connection is None:
-            _connection = sqlite3.connect(_DB_PATH, check_same_thread=False)
-            _connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS receipts (
-                    execution_id TEXT NOT NULL,
-                    state        TEXT NOT NULL
-                )
-                """
-            )
-            _connection.commit()
-        return _connection
+# Lock used in the FIXED version. Defined here so the module structure
+# is identical before and after the fix.
+_receipt_lock = threading.Lock()
 
 
-def reset_db() -> None:
-    """Drop and recreate the receipts table. Use only in tests."""
-    global _connection
-    with _connection_lock:
-        if _connection is not None:
-            _connection.execute("DROP TABLE IF EXISTS receipts")
-            _connection.execute(
-                """
-                CREATE TABLE receipts (
-                    execution_id TEXT NOT NULL,
-                    state        TEXT NOT NULL
-                )
-                """
-            )
-            _connection.commit()
-        else:
-            _get_connection()
+def reset_store() -> None:
+    """Clear all receipts. Use only in tests."""
+    _store.clear()
 
 
 def get_receipt(execution_id: str) -> Optional[str]:
     """Return the recorded terminal state, or None if no receipt exists."""
-    conn = _get_connection()
-    row = conn.execute(
-        "SELECT state FROM receipts WHERE execution_id = ?",
-        (execution_id,),
-    ).fetchone()
-    return row[0] if row else None
+    for eid, state in _store:
+        if eid == execution_id:
+            return state
+    return None
 
 
 def record_terminal(execution_id: str, state: str) -> bool:
@@ -74,19 +49,14 @@ def record_terminal(execution_id: str, state: str) -> bool:
     Returns True if the receipt was written, False if one already existed.
 
     RACE CONDITION: the check and the write are not atomic. Two threads
-    can both pass the check before either completes the write.
+    can both pass the existence check before either appends to the store,
+    resulting in two receipts for the same execution_id.
     """
-    conn = _get_connection()
-
-    # CHECK — reads current state
-    existing = get_receipt(execution_id)
-    if existing is not None:
+    # CHECK — reads current state (not protected by any lock)
+    if get_receipt(execution_id) is not None:
         return False
 
-    # ACT — writes new state (gap between check and write is exploitable)
-    conn.execute(
-        "INSERT INTO receipts (execution_id, state) VALUES (?, ?)",
-        (execution_id, state),
-    )
-    conn.commit()
+    # ACT — writes new state
+    # Gap between check and write above is exploitable by a racing thread.
+    _store.append((execution_id, state))
     return True
