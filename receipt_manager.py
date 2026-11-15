@@ -1,17 +1,17 @@
 """
-Receipt manager with an intentional check-then-act race condition.
+Receipt manager — fixed implementation.
 
-A receipt records the terminal state of a processing execution:
-either 'done' (stage completion) or 'timeout' (watchdog timeout).
-Only one terminal receipt should ever exist per execution_id.
+The check-and-write in record_terminal() is now protected by _receipt_lock,
+making the state transition atomic from the perspective of competing threads
+in the same process.
 
-The store is an unsynchronized list of (execution_id, state) tuples.
-Using a list (rather than a dict) makes duplicate receipts visible as
-distinct entries — which is what we need to prove the race occurred.
+Thread-level guarantee: _receipt_lock prevents concurrent access from any
+thread that holds a reference to this module.
 
-BUG: record_terminal() reads the current state and writes in separate
-steps without holding any lock. Two threads can both observe no existing
-receipt and both proceed to append, producing duplicate terminal records.
+Process-level guarantee: not provided by this lock. If multiple processes
+(or distributed workers) call record_terminal() concurrently, a database
+uniqueness constraint (UNIQUE index + INSERT OR IGNORE, or SELECT FOR UPDATE
+in a transactional DB) is required. See README for the full discussion.
 """
 
 from __future__ import annotations
@@ -20,12 +20,13 @@ import threading
 from typing import Optional
 
 # Backing store: list of (execution_id, state) tuples.
-# A list is used so duplicate receipts accumulate as separate entries.
-# No internal synchronization — the race is real.
+# A list is used so duplicate receipts accumulate as separate entries —
+# making violations visible in tests.
 _store: list[tuple[str, str]] = []
 
-# Lock used in the FIXED version. Defined here so the module structure
-# is identical before and after the fix.
+# Shared lock. Both record_terminal() paths (stage completion and watchdog)
+# must acquire this lock before checking or writing. This makes the combined
+# check-and-write atomic from the perspective of all threads in this process.
 _receipt_lock = threading.Lock()
 
 
@@ -48,15 +49,12 @@ def record_terminal(execution_id: str, state: str) -> bool:
 
     Returns True if the receipt was written, False if one already existed.
 
-    RACE CONDITION: the check and the write are not atomic. Two threads
-    can both pass the existence check before either appends to the store,
-    resulting in two receipts for the same execution_id.
+    The lock ensures that only one thread can execute the check-and-write
+    sequence at a time. Any thread that loses the race sees the existing
+    receipt during the check and returns False without writing.
     """
-    # CHECK — reads current state (not protected by any lock)
-    if get_receipt(execution_id) is not None:
-        return False
-
-    # ACT — writes new state
-    # Gap between check and write above is exploitable by a racing thread.
-    _store.append((execution_id, state))
-    return True
+    with _receipt_lock:
+        if get_receipt(execution_id) is not None:
+            return False
+        _store.append((execution_id, state))
+        return True
